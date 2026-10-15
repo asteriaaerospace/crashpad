@@ -33,6 +33,107 @@
 
 namespace crashpad {
 
+namespace {
+
+const wchar_t* ExceptionName(uint32_t code) {
+  switch (code) {
+    case 0xc0000005: return L"ACCESS_VIOLATION";
+    case 0xc0000094: return L"INTEGER_DIVIDE_BY_ZERO";
+    case 0xc00000fd: return L"STACK_OVERFLOW";
+    case 0xc000001d: return L"ILLEGAL_INSTRUCTION";
+    case 0xc0000374: return L"HEAP_CORRUPTION";
+    case 0xc0000409: return L"STACK_BUFFER_OVERRUN";
+    default: return L"UNKNOWN";
+  }
+}
+
+void WriteCrashInfoFile(const CrashReportDatabase::Report& report,
+                        const ProcessSnapshotWin& process_snapshot) {
+  const base::FilePath info_path(report.file_path.RemoveFinalExtension().value() +
+                                 L".txt");
+  const base::FilePath temporary_path(info_path.value() + L".tmp");
+  HANDLE file = CreateFileW(temporary_path.value().c_str(), GENERIC_WRITE, 0,
+                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                            nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    LOG(ERROR) << "Unable to create crash info file, error " << GetLastError();
+    return;
+  }
+
+  // Make the UTF-16LE encoding explicit for Notepad and PowerShell. The
+  // metadata itself is written as wide characters below.
+  constexpr wchar_t kUtf16LeByteOrderMark = 0xfeff;
+  DWORD written = 0;
+  if (!::WriteFile(file, &kUtf16LeByteOrderMark,
+                   sizeof(kUtf16LeByteOrderMark), &written, nullptr) ||
+      written != sizeof(kUtf16LeByteOrderMark)) {
+    LOG(ERROR) << "Unable to write crash info file encoding marker, error "
+               << GetLastError();
+    CloseHandle(file);
+    DeleteFileW(temporary_path.value().c_str());
+    return;
+  }
+
+  const auto& annotations = process_snapshot.AnnotationsSimpleMap();
+  const auto annotation = [&annotations](const char* key) {
+    const auto value = annotations.find(key);
+    return value == annotations.end() ? std::wstring(L"unknown")
+                                      : base::UTF8ToWide(value->second);
+  };
+  const std::wstring application = annotation("mcs_version");
+  const std::wstring build_date = annotation("mcs_build_date");
+  const ExceptionSnapshot* exception = process_snapshot.Exception();
+
+  SYSTEMTIME now;
+  GetLocalTime(&now);
+  wchar_t buffer[4096] = {};
+  int length = swprintf_s(
+      buffer, sizeof(buffer) / sizeof(buffer[0]),
+      L"Crash Analytics Report\r\n"
+      L"======================\r\n"
+      L"Time (local) : %04u-%02u-%02u %02u:%02u:%02u.%03u\r\n"
+      L"Application  : %s\r\n"
+      L"Build date   : %s\r\n"
+      L"Process ID   : %lu\r\n"
+      L"Thread ID    : %llu\r\n"
+      L"Exception    : 0x%08X (%s)\r\n"
+      L"Fault address: 0x%llX\r\n"
+      L"Report ID    : %s\r\n"
+      L"Minidump file: %s\r\n"
+      L"Crashpad DB  : %s\r\n"
+      L"Dump written : yes\r\n"
+      L"Symbolize    : Scripts/symbolize_crash.ps1 <this .dmp>\r\n",
+      now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
+      now.wMilliseconds, application.c_str(),
+      build_date.c_str(),
+      static_cast<unsigned long>(process_snapshot.ProcessID()),
+      static_cast<unsigned long long>(exception ? exception->ThreadID() : 0),
+      exception ? exception->Exception() : 0,
+      ExceptionName(exception ? exception->Exception() : 0),
+      static_cast<unsigned long long>(exception ? exception->ExceptionAddress() : 0),
+      report.uuid.ToWString().c_str(), report.file_path.value().c_str(),
+      report.file_path.DirName().DirName().value().c_str());
+  if (length > 0) {
+    written = 0;
+    const DWORD expected = static_cast<DWORD>(length * sizeof(wchar_t));
+    if (!::WriteFile(file, buffer, expected, &written, nullptr) ||
+        written != expected) {
+      LOG(ERROR) << "Unable to write crash info file, error " << GetLastError();
+      CloseHandle(file);
+      DeleteFileW(temporary_path.value().c_str());
+      return;
+    }
+  }
+  CloseHandle(file);
+  if (!MoveFileExW(temporary_path.value().c_str(), info_path.value().c_str(),
+                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    LOG(ERROR) << "Unable to finalize crash info file, error " << GetLastError();
+    DeleteFileW(temporary_path.value().c_str());
+  }
+}
+
+}  // namespace
+
 CrashReportExceptionHandler::CrashReportExceptionHandler(
     CrashReportDatabase* database,
     CrashReportUploadThread* upload_thread,
@@ -140,6 +241,14 @@ unsigned int CrashReportExceptionHandler::ExceptionHandlerServerException(
       Metrics::ExceptionCaptureResult(
           Metrics::CaptureResult::kFinishedWritingCrashReportFailed);
       return termination_code;
+    }
+
+    CrashReportDatabase::Report report;
+    if (database_->LookUpCrashReport(uuid, &report) ==
+        CrashReportDatabase::kNoError) {
+      WriteCrashInfoFile(report, process_snapshot);
+    } else {
+      LOG(ERROR) << "LookUpCrashReport failed while writing crash info file";
     }
 
     if (upload_thread_) {
